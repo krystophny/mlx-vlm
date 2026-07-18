@@ -155,6 +155,12 @@ def _server_runtime_snapshot() -> dict:
         "continuous_batching_enabled": runtime.response_generator is not None,
         "request_queue_depth": queue_depth,
         "audio_queue_depth": audio_queue_depth,
+        "distributed": (
+            {"enabled": False, "world_size": 1, "rank": 0, "ready": True}
+            if runtime.response_generator is None
+            or not hasattr(runtime.response_generator, "distributed_snapshot")
+            else runtime.response_generator.distributed_snapshot()
+        ),
         "apc": (
             {"enabled": False}
             if runtime.apc_manager is None
@@ -251,6 +257,7 @@ def _build_gen_args(
         ),
         chat_template_kwargs=getattr(request, "chat_template_kwargs", None),
         tenant_id=tenant_id,
+        structured_schema=_extract_response_format_schema(request),
     )
     if processor is not None:
         args.logits_processors = _build_structured_logits_processors(request, processor)
@@ -512,9 +519,7 @@ async def lifespan(app):
     try:
         yield
     finally:
-        if runtime.audio_queue is not None:
-            runtime.audio_queue.stop_and_join()
-            runtime.audio_queue = None
+        unload_model_sync()
 
 
 app = FastAPI(

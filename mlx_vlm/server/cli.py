@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 
+import mlx.core as mx
 import uvicorn
 
 from ..generate import (
@@ -84,6 +85,42 @@ def main():
         type=int,
         default=DEFAULT_PREFILL_STEP_SIZE,
         help="Tokens per prefill step (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--active-prefill-step-size",
+        type=int,
+        default=0,
+        help="Tokens per prefill step while decode requests are active.",
+    )
+    parser.add_argument(
+        "--decode-concurrency",
+        type=int,
+        default=4,
+        help="Maximum number of concurrent decode sequences.",
+    )
+    parser.add_argument(
+        "--prompt-concurrency",
+        type=int,
+        default=1,
+        help="Maximum number of prompts in one prefill batch.",
+    )
+    parser.add_argument(
+        "--max-active-kv-tokens",
+        type=int,
+        default=0,
+        help="Aggregate prompt plus output token admission budget.",
+    )
+    parser.add_argument(
+        "--prefill-delay-ms",
+        type=float,
+        default=0.0,
+        help="Maximum time to postpone prefill while decode is active.",
+    )
+    parser.add_argument(
+        "--distributed-backend",
+        choices=("any", "jaccl", "ring", "mpi", "nccl"),
+        default="any",
+        help="MLX distributed backend. Select jaccl for Thunderbolt RDMA.",
     )
     parser.add_argument(
         "--max-tokens",
@@ -237,6 +274,11 @@ def main():
         os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
+    os.environ["MLX_VLM_ACTIVE_PREFILL_STEP_SIZE"] = str(args.active_prefill_step_size)
+    os.environ["MLX_VLM_DECODE_CONCURRENCY"] = str(args.decode_concurrency)
+    os.environ["MLX_VLM_PROMPT_CONCURRENCY"] = str(args.prompt_concurrency)
+    os.environ["MLX_VLM_MAX_ACTIVE_KV_TOKENS"] = str(args.max_active_kv_tokens)
+    os.environ["MLX_VLM_PREFILL_DELAYER_MAX_DELAY_MS"] = str(args.prefill_delay_ms)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
     os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"
     if args.thinking_budget is not None:
@@ -263,6 +305,19 @@ def main():
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
     logger.setLevel(log_level)
+
+    group = mx.distributed.init(backend=args.distributed_backend)
+    if group.size() > 1 and args.reload:
+        parser.error("--reload is not supported in distributed mode")
+    if group.rank() != 0:
+        if args.model is None:
+            parser.error("Distributed worker ranks require --model")
+        from .app import get_cached_model
+        from .runtime import runtime
+
+        get_cached_model(args.model, args.adapter_path, model_kind="text_generation")
+        runtime.response_generator.join()
+        return
 
     uvicorn.run(
         "mlx_vlm.server:app",

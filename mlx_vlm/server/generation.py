@@ -1,14 +1,16 @@
 import gc
 import logging
 import os
+import pickle
+import signal
 import time
 import traceback
 from collections import deque
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Event, Lock, Thread
+from threading import Condition, Event, Lock, Thread
 from typing import Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
@@ -43,9 +45,12 @@ from ..speculative.utils import (
     speculative_hidden_state,
     speculative_prefill_kwargs,
 )
-from ..structured import ThinkingAwareLogitsProcessor
+from ..structured import (
+    ThinkingAwareLogitsProcessor,
+    build_json_schema_logits_processor,
+)
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
-from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
+from ..utils import ThinkingBudgetCriteria, load, prepare_inputs, sharded_load
 from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -53,6 +58,9 @@ logger = logging.getLogger("mlx_vlm.server")
 DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
 DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
 DEFAULT_PREFILL_DELAYER_MAX_DELAY_MS = 5000.0
+DEFAULT_DECODE_CONCURRENCY = 4
+DEFAULT_PROMPT_CONCURRENCY = 1
+DEFAULT_MAX_ACTIVE_KV_TOKENS = 0
 DEFAULT_ENABLE_THINKING = False
 METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
@@ -78,6 +86,24 @@ def _notify_queues(queues, *items):
 
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
+
+
+def get_active_prefill_step_size():
+    return int(os.environ.get("MLX_VLM_ACTIVE_PREFILL_STEP_SIZE", "0"))
+
+
+def get_decode_concurrency():
+    return int(os.environ.get("MLX_VLM_DECODE_CONCURRENCY", DEFAULT_DECODE_CONCURRENCY))
+
+
+def get_prompt_concurrency():
+    return int(os.environ.get("MLX_VLM_PROMPT_CONCURRENCY", DEFAULT_PROMPT_CONCURRENCY))
+
+
+def get_max_active_kv_tokens():
+    return int(
+        os.environ.get("MLX_VLM_MAX_ACTIVE_KV_TOKENS", DEFAULT_MAX_ACTIVE_KV_TOKENS)
+    )
 
 
 def get_server_max_tokens():
@@ -610,9 +636,15 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
         trust_remote_code = (
             os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
         )
-        model, processor = load(
-            model_path, adapter_path, trust_remote_code=trust_remote_code
-        )
+        group = mx.distributed.init()
+        if group.size() > 1:
+            if adapter_path is not None:
+                raise ValueError("Adapters are not supported in distributed mode")
+            model, processor = sharded_load(model_path, tensor_group=group)
+        else:
+            model, processor = load(
+                model_path, adapter_path, trust_remote_code=trust_remote_code
+            )
         config = model.config
         print("Model and processor loaded successfully.")
         return model, processor, config
@@ -664,6 +696,7 @@ class GenerationArguments:
     thinking_end_token: Optional[str] = None
     skip_special_tokens: bool = True
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None
+    structured_schema: Optional[dict] = None
     # Per-tenant salt for APC. When set, it's mixed into ``extra_hash`` so
     # cached blocks from one tenant can't be reused (or detected via timing)
     # by another. None = no salt = single-tenant behaviour.
@@ -767,9 +800,22 @@ class QueuedGenerationRequest:
     raw_inputs: dict
     prompt_tokens: int
     args: GenerationArguments
+    request_id: int = -1
     thinking_budget_criteria: Optional[ThinkingBudgetCriteria] = None
     images: Optional[List] = None
     videos: Optional[List] = None
+
+
+@dataclass
+class _StopRequest:
+    pass
+
+
+class _WorkerQueue:
+    """Discard worker-rank responses while preserving scheduler symmetry."""
+
+    def put(self, _item):
+        return None
 
 
 @dataclass
@@ -972,6 +1018,9 @@ class ResponseGenerator:
         self.apc_manager = apc_manager
         self.tokenizer = None
         self.requests: Queue = Queue()
+        self._group = mx.distributed.init()
+        self._is_distributed = self._group.size() > 1
+        self._rank = self._group.rank()
         self._stop = False
         self._ready = Event()
         self._load_error: Optional[Exception] = None
@@ -979,13 +1028,40 @@ class ResponseGenerator:
         self._cancel_lock = Lock()
         self._tokenizer_lock = Lock()
         self._prefill_delay_started_at: Optional[float] = None
+        self._budget_condition = Condition()
+        self._budget_limit = get_max_active_kv_tokens()
+        self._budget_used = 0
+        self._budget_reservations: dict[int, int] = {}
+        self._next_request_id = 0
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def stop_and_join(self):
         self._stop = True
-        self.requests.put(None)
-        self._thread.join(timeout=5.0)
+        if self._rank == 0:
+            self.requests.put(_StopRequest())
+        self._thread.join(timeout=30.0)
+
+    def join(self):
+        self._thread.join()
+        if self._load_error is not None:
+            raise self._load_error
+
+    def distributed_snapshot(self):
+        with self._budget_condition:
+            return {
+                "enabled": self._is_distributed,
+                "world_size": self._group.size(),
+                "rank": self._rank,
+                "ready": self._ready.is_set() and self._load_error is None,
+                "decode_concurrency": get_decode_concurrency(),
+                "prompt_concurrency": get_prompt_concurrency(),
+                "prefill_step_size": get_prefill_step_size(),
+                "active_prefill_step_size": get_active_prefill_step_size(),
+                "max_active_kv_tokens": self._budget_limit,
+                "reserved_active_kv_tokens": self._budget_used,
+                "reserved_requests": len(self._budget_reservations),
+            }
 
     def wait_until_ready(self, timeout: Optional[float] = None):
         if not self._ready.wait(timeout):
@@ -1002,6 +1078,133 @@ class ResponseGenerator:
         with self._cancel_lock:
             pending, self._cancelled = self._cancelled, set()
             return pending
+
+    def _reserve_token_budget(self, amount: int) -> int:
+        if getattr(self, "_rank", 0) != 0:
+            raise RuntimeError("Only rank 0 accepts generation requests")
+        if not hasattr(self, "_budget_condition"):
+            return -1
+        if self._budget_limit > 0 and amount > self._budget_limit:
+            raise PromptTooLongError(
+                f"Request requires {amount} active KV tokens but the aggregate "
+                f"server budget is {self._budget_limit}."
+            )
+        timeout = get_token_queue_timeout()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._budget_condition:
+            while (
+                self._budget_limit > 0
+                and self._budget_used + amount > self._budget_limit
+            ):
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise RuntimeError("Timed out waiting for aggregate KV capacity")
+                self._budget_condition.wait(remaining)
+            request_id = self._next_request_id
+            self._next_request_id += 1
+            self._budget_reservations[request_id] = amount
+            self._budget_used += amount
+            return request_id
+
+    def _release_token_budget(self, request_id: int):
+        if request_id < 0 or getattr(self, "_rank", 0) != 0:
+            return
+        if not hasattr(self, "_budget_condition"):
+            return
+        with self._budget_condition:
+            amount = self._budget_reservations.pop(request_id, 0)
+            self._budget_used -= amount
+            if amount:
+                self._budget_condition.notify_all()
+
+    def _share_object(self, obj):
+        if not getattr(self, "_is_distributed", False):
+            return obj
+        if getattr(self, "_rank", 0) == 0:
+            if obj is None:
+                mx.eval(mx.distributed.all_sum(mx.array(0, dtype=mx.int32)))
+                return None
+            data = mx.array(pickle.dumps(obj), dtype=mx.uint8)
+            mx.eval(mx.distributed.all_sum(mx.array(data.size, dtype=mx.int32)))
+            mx.eval(mx.distributed.all_sum(data))
+            return obj
+        size = mx.distributed.all_sum(mx.array(0, dtype=mx.int32)).item()
+        if size == 0:
+            return None
+        data = mx.distributed.all_sum(mx.zeros(size, dtype=mx.uint8))
+        mx.eval(data)
+        return pickle.loads(bytes(data.tolist()))
+
+    def _restore_shared_request(self, request, rqueue):
+        if isinstance(request, _StopRequest):
+            return request
+        args = request.args
+        if args.structured_schema is not None:
+            tokenizer = (
+                self.processor.tokenizer
+                if hasattr(self.processor, "tokenizer")
+                else self.processor
+            )
+            args = replace(
+                args,
+                logits_processors=[
+                    build_json_schema_logits_processor(
+                        tokenizer, args.structured_schema
+                    )
+                ],
+            )
+        criteria = self._make_thinking_budget_criteria(
+            args, request.raw_inputs.get("input_ids")
+        )
+        return replace(
+            request,
+            rqueue=rqueue,
+            args=args,
+            thinking_budget_criteria=criteria,
+        )
+
+    def _next_request(self, timeout=None):
+        request = None
+        is_distributed = getattr(self, "_is_distributed", False)
+        rank = getattr(self, "_rank", 0)
+        if not is_distributed or rank == 0:
+            try:
+                request = (
+                    self.requests.get(timeout=timeout)
+                    if timeout is not None
+                    else self.requests.get_nowait()
+                )
+            except QueueEmpty:
+                pass
+        if not is_distributed:
+            return request
+        if rank == 0 and request is not None and not isinstance(request, _StopRequest):
+            if (
+                request.args.logits_processors is not None
+                and request.args.structured_schema is None
+            ):
+                raise ValueError(
+                    "Custom logits processors are not supported in distributed mode"
+                )
+            payload = replace(
+                request,
+                rqueue=None,
+                args=replace(request.args, logits_processors=None),
+                thinking_budget_criteria=None,
+            )
+        else:
+            payload = request
+        payload = self._share_object(payload)
+        if payload is None or isinstance(payload, _StopRequest):
+            return payload
+        rqueue = request.rqueue if rank == 0 else _WorkerQueue()
+        return self._restore_shared_request(payload, rqueue)
+
+    def _share_cancellations(self):
+        cancelled = (
+            self._drain_cancellations() if getattr(self, "_rank", 0) == 0 else None
+        )
+        return self._share_object(cancelled) or set()
 
     def _initialize_model(self):
         model, processor, config = load_model_resources(
@@ -1090,10 +1293,12 @@ class ResponseGenerator:
             )
         prompt_tokens = _count_prompt_tokens(raw_inputs)
         _check_configured_context_budget(prompt_tokens, args.max_tokens)
+        request_id = self._reserve_token_budget(prompt_tokens + args.max_tokens)
 
         self.requests.put(
             QueuedGenerationRequest(
                 rqueue=rqueue,
+                request_id=request_id,
                 raw_inputs=raw_inputs,
                 prompt_tokens=prompt_tokens,
                 args=args,
@@ -1106,6 +1311,7 @@ class ResponseGenerator:
         # Block until the GPU thread sends back the context
         ctx = rqueue.get()
         if isinstance(ctx, Exception):
+            self._release_token_budget(request_id)
             raise ctx
 
         return ctx, _TokenIterator(
@@ -1285,17 +1491,19 @@ class ResponseGenerator:
 
         def append_item(item):
             nonlocal should_stop
+            if isinstance(item, _StopRequest):
+                self._stop = True
+                should_stop = True
+                return
             if item is None:
-                if self._stop and not pending:
-                    should_stop = True
                 return
             pending.append(item)
 
         try:
             if active:
-                append_item(self.requests.get_nowait())
+                append_item(self._next_request())
             else:
-                append_item(self.requests.get(timeout=idle_timeout))
+                append_item(self._next_request(timeout=idle_timeout))
         except QueueEmpty:
             pass
 
@@ -1303,10 +1511,10 @@ class ResponseGenerator:
             time.sleep(coalesce_s)
 
         while not should_stop:
-            try:
-                append_item(self.requests.get_nowait())
-            except QueueEmpty:
+            item = self._next_request()
+            if item is None:
                 break
+            append_item(item)
 
         return pending, should_stop
 
@@ -1337,6 +1545,11 @@ class ResponseGenerator:
         batch_gen = None
         # uid -> {rqueue, tokens, gen_kwargs}
         active: dict = {}
+        current_request = None
+
+        if getattr(self, "_is_distributed", False):
+            seed = mx.distributed.all_sum(mx.random.state[0]).view(mx.uint64).item()
+            mx.random.seed(seed)
 
         while not self._stop:
             try:
@@ -1360,12 +1573,13 @@ class ResponseGenerator:
                     break
 
                 # Drop abandoned requests before doing more work.
-                cancelled = self._drain_cancellations()
+                cancelled = self._share_cancellations()
                 if cancelled and batch_gen is not None:
                     for uid in cancelled:
                         if uid in active:
                             batch_gen.remove(uid)
                             info = active.pop(uid)
+                            self._release_token_budget(info.get("request_id", -1))
                             try:
                                 info["rqueue"].put(None)
                             except Exception:
@@ -1377,6 +1591,7 @@ class ResponseGenerator:
                         batch_gen = None
 
                 for request in new_items:
+                    current_request = request
                     rqueue = request.rqueue
                     raw_inputs = request.raw_inputs
                     prompt_tokens = request.prompt_tokens
@@ -1401,6 +1616,8 @@ class ResponseGenerator:
                             draft_block_size=_get_draft_block_size_from_env(),
                             greedy_sampling=args.temperature == 0,
                             prefill_step_size=get_prefill_step_size(),
+                            completion_batch_size=get_decode_concurrency(),
+                            prefill_batch_size=get_prompt_concurrency(),
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization
@@ -1435,7 +1652,9 @@ class ResponseGenerator:
                             thinking_budget_criteria=[thinking_budget_criteria],
                         )
                     except Exception as e:
+                        self._release_token_budget(request.request_id)
                         rqueue.put(e)
+                        current_request = None
                         continue
 
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
@@ -1448,7 +1667,9 @@ class ResponseGenerator:
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                         "prompt_tps": None,
                         "cached_tokens": 0,
+                        "request_id": request.request_id,
                     }
+                    current_request = None
 
                 if not active or batch_gen is None:
                     continue
@@ -1457,7 +1678,15 @@ class ResponseGenerator:
 
             except Exception as e:
                 logger.exception("Error in generation thread")
+                if current_request is not None:
+                    self._release_token_budget(current_request.request_id)
+                    try:
+                        current_request.rqueue.put(e)
+                    except Exception:
+                        pass
+                    current_request = None
                 for info in list(active.values()):
+                    self._release_token_budget(info.get("request_id", -1))
                     try:
                         info["rqueue"].put(e)
                         info["rqueue"].put(None)
@@ -1467,6 +1696,10 @@ class ResponseGenerator:
                 batch_gen = None
                 mx.clear_cache()
                 gc.collect()
+                if getattr(self, "_is_distributed", False):
+                    self._load_error = e
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    break
 
         if batch_gen is not None and callable(getattr(batch_gen, "close", None)):
             batch_gen.close()
@@ -1884,6 +2117,7 @@ class ResponseGenerator:
 
             if r.finish_reason is not None:
                 rqueue.put(None)
+                self._release_token_budget(info.get("request_id", -1))
                 del active[r.uid]
 
     def _scheduler_iteration(self, batch_gen, active):
@@ -1910,6 +2144,15 @@ class ResponseGenerator:
                     return
 
         self._prefill_delay_started_at = None
+        prefill_step_size = (
+            get_active_prefill_step_size()
+            if responses and get_active_prefill_step_size() > 0
+            else get_prefill_step_size()
+        )
+        batch_gen.prefill_step_size = prefill_step_size
+        prompt_batch = getattr(batch_gen, "_prompt_batch", None)
+        if prompt_batch is not None:
+            prompt_batch.prefill_step_size = prefill_step_size
         prompt_responses = batch_gen.prefill_step()
         self._record_prompt_progress(prompt_responses, active)
 

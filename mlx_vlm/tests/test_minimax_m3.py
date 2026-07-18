@@ -30,6 +30,23 @@ from mlx_vlm.models.switch_layers import SwitchGLU
 from mlx_vlm.prompt_utils import apply_chat_template
 
 
+def test_minimax_m3_vlm_exposes_language_model_sharding():
+    calls = []
+    model = Model.__new__(Model)
+    object.__setattr__(
+        model,
+        "language_model",
+        type(
+            "LanguageModelStub", (), {"shard": lambda self, group: calls.append(group)}
+        )(),
+    )
+    group = object()
+
+    model.shard(group)
+
+    assert calls == [group]
+
+
 def _fill_minimax_cache(cache, seq_len, *, offset=0):
     keys = mx.arange(seq_len * 4, dtype=mx.float32).reshape(1, 1, seq_len, 4)
     values = keys + 1000 + offset

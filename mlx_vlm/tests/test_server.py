@@ -20,8 +20,8 @@ from PIL import Image
 import mlx_vlm.server as server
 import mlx_vlm.server.cli as server_cli
 import mlx_vlm.server.generation as server_generation
-import mlx_vlm.server.schemas as server_schemas
 import mlx_vlm.server.openai as server_openai
+import mlx_vlm.server.schemas as server_schemas
 import mlx_vlm.speculative.utils as speculative_utils
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
@@ -548,6 +548,55 @@ def test_server_reads_prefill_delayer_env(monkeypatch):
 
     monkeypatch.setenv("MLX_VLM_PREFILL_DELAYER_MAX_DELAY_MS", "bad")
     assert server_generation.get_prefill_delayer_max_delay_s() == pytest.approx(5.0)
+
+
+def test_server_reads_batch_and_admission_env(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_ACTIVE_PREFILL_STEP_SIZE", "256")
+    monkeypatch.setenv("MLX_VLM_DECODE_CONCURRENCY", "4")
+    monkeypatch.setenv("MLX_VLM_PROMPT_CONCURRENCY", "1")
+    monkeypatch.setenv("MLX_VLM_MAX_ACTIVE_KV_TOKENS", "262144")
+
+    assert server_generation.get_active_prefill_step_size() == 256
+    assert server_generation.get_decode_concurrency() == 4
+    assert server_generation.get_prompt_concurrency() == 1
+    assert server_generation.get_max_active_kv_tokens() == 262144
+
+
+def test_aggregate_kv_budget_reserves_and_releases():
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen._rank = 0
+    gen._budget_condition = server_generation.Condition()
+    gen._budget_limit = 100
+    gen._budget_used = 0
+    gen._budget_reservations = {}
+    gen._next_request_id = 0
+
+    request_id = gen._reserve_token_budget(80)
+    assert gen._budget_used == 80
+    assert gen._budget_reservations == {request_id: 80}
+
+    gen._release_token_budget(request_id)
+    assert gen._budget_used == 0
+    assert gen._budget_reservations == {}
+
+
+def test_distributed_model_load_uses_sharded_load(monkeypatch):
+    group = SimpleNamespace(size=lambda: 2)
+    model = SimpleNamespace(config=SimpleNamespace(model_type="test"))
+    processor = SimpleNamespace()
+    calls = []
+    monkeypatch.setattr(server_generation.mx.distributed, "init", lambda: group)
+    monkeypatch.setattr(
+        server_generation,
+        "sharded_load",
+        lambda path, tensor_group: calls.append((path, tensor_group))
+        or (model, processor),
+    )
+
+    loaded = server_generation.load_model_resources("demo/model", None)
+
+    assert loaded == (model, processor, model.config)
+    assert calls == [("demo/model", group)]
 
 
 def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
@@ -4783,6 +4832,50 @@ class TestResponseGenerator:
 
         assert batch.calls == ["decode", "prefill"]
         assert rqueue.get().token == 0
+
+    def test_scheduler_uses_small_prefill_chunks_during_decode(self, monkeypatch):
+        class RunningBatch:
+            has_pending_prompts = True
+
+            def __init__(self):
+                self._prompt_batch = SimpleNamespace(prefill_step_size=None)
+                self.prefill_step_size = None
+
+            def decode_step(self):
+                return [
+                    SimpleNamespace(
+                        uid=1,
+                        token=0,
+                        token_logprob=0.0,
+                        finish_reason=None,
+                    )
+                ]
+
+            def prefill_step(self):
+                return []
+
+        class Streamer:
+            def advance(self, token, finish_reason):
+                return str(token)
+
+        monkeypatch.setenv("PREFILL_STEP_SIZE", "4096")
+        monkeypatch.setenv("MLX_VLM_ACTIVE_PREFILL_STEP_SIZE", "256")
+        monkeypatch.setenv("MLX_VLM_PREFILL_DELAYER_MAX_DELAY_MS", "0")
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        active = {
+            1: {
+                "rqueue": Queue(),
+                "streamer": Streamer(),
+                "prompt_tps": None,
+                "cached_tokens": 0,
+            }
+        }
+        batch = RunningBatch()
+
+        gen._scheduler_iteration(batch, active)
+
+        assert batch.prefill_step_size == 256
+        assert batch._prompt_batch.prefill_step_size == 256
 
     def test_scheduler_delays_prefill_while_decode_is_progressing(self, monkeypatch):
         class RunningBatch:

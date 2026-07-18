@@ -429,6 +429,10 @@ class Model(nn.Module):
     def make_cache(self):
         return self.language_model.make_cache()
 
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        """Tensor-parallelize the language model and replicate vision."""
+        return self.language_model.shard(group)
+
     @property
     def quant_predicate(self):
         return self.language_model.quant_predicate

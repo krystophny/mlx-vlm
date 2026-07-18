@@ -92,6 +92,22 @@ def test_chat_thinking_mode_flag():
     _assert_thinking_mode_flag("mlx_vlm/chat.py")
 
 
+def test_server_exposes_distributed_batching_controls():
+    module = _load_module("mlx_vlm/server/cli.py")
+    expected_defaults = {
+        "--active-prefill-step-size": 0,
+        "--decode-concurrency": 4,
+        "--prompt-concurrency": 1,
+        "--max-active-kv-tokens": 0,
+        "--prefill-delay-ms": 0.0,
+        "--distributed-backend": "any",
+    }
+    for flag, expected in expected_defaults.items():
+        default = _keyword_map(_find_add_argument(module, flag))["default"]
+        assert isinstance(default, ast.Constant)
+        assert default.value == expected
+
+
 def _find_function_def(module: ast.Module, name: str) -> ast.FunctionDef:
     for node in ast.walk(module):
         if isinstance(node, ast.FunctionDef) and node.name == name:
