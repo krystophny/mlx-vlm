@@ -18,7 +18,6 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import mlx_vlm.server as server
-import mlx_vlm.server.app as server_app
 import mlx_vlm.server.cli as server_cli
 import mlx_vlm.server.generation as server_generation
 import mlx_vlm.server.schemas as server_schemas
@@ -4763,7 +4762,9 @@ class TestResponseGenerator:
             messages=[{"role": "user", "content": "hi"}],
             chat_template_kwargs={"reasoning_effort": "high"},
         )
-        args = server_app._build_gen_args(request)
+        from mlx_vlm.server.app import _build_gen_args
+
+        args = _build_gen_args(request)
         assert args.chat_template_kwargs == {"reasoning_effort": "high"}
 
     def test_generate_arguments_omits_none_optionals(self):
