@@ -249,6 +249,7 @@ def _build_gen_args(
         thinking_end_token=_request_field_or_default(
             request, "thinking_end_token", get_server_thinking_end_token()
         ),
+        chat_template_kwargs=getattr(request, "chat_template_kwargs", None),
         tenant_id=tenant_id,
     )
     if processor is not None:

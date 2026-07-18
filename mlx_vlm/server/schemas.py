@@ -1,5 +1,5 @@
 import os
-from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing_extensions import Required, TypeAlias, TypedDict
@@ -363,6 +363,15 @@ class OpenAIRequest(FlexibleBaseModel):
         None, description="Thinking start token."
     )
     thinking_end_token: Optional[str] = Field(None, description="Thinking end token.")
+    chat_template_kwargs: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Extra keyword arguments forwarded verbatim to the chat template "
+            "(e.g. {\"reasoning_effort\": \"high\"} or "
+            "{\"thinking_mode\": \"enabled\"}). Keys here override the "
+            "server-side thinking defaults."
+        ),
+    )
     stream: bool = Field(
         False, description="Whether to stream the response chunk by chunk."
     )
@@ -726,6 +735,15 @@ class VLMRequest(FlexibleBaseModel):
         None, description="Thinking start token."
     )
     thinking_end_token: Optional[str] = Field(None, description="Thinking end token.")
+    chat_template_kwargs: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Extra keyword arguments forwarded verbatim to the chat template "
+            "(e.g. {\"reasoning_effort\": \"high\"} or "
+            "{\"thinking_mode\": \"enabled\"}). Keys here override the "
+            "server-side thinking defaults."
+        ),
+    )
     logprobs: Optional[bool] = Field(
         None,
         description="Return log-probabilities for each output token.",

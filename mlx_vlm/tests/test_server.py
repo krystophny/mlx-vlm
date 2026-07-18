@@ -18,8 +18,10 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import mlx_vlm.server as server
+import mlx_vlm.server.app as server_app
 import mlx_vlm.server.cli as server_cli
 import mlx_vlm.server.generation as server_generation
+import mlx_vlm.server.schemas as server_schemas
 import mlx_vlm.server.openai as server_openai
 import mlx_vlm.speculative.utils as speculative_utils
 from mlx_vlm.apc import hash_image_payload
@@ -4739,6 +4741,29 @@ class TestResponseGenerator:
         assert kw["enable_thinking"] is False
         assert kw["thinking_budget"] == 50
         assert kw["thinking_end_token"] == "</think>"
+
+    def test_generate_arguments_chat_template_kwargs_passthrough(self):
+        args = server.GenerationArguments(
+            enable_thinking=False,
+            chat_template_kwargs={
+                "reasoning_effort": "high",
+                "thinking_mode": "enabled",
+                "enable_thinking": True,
+            },
+        )
+        kw = args.to_template_kwargs()
+        assert kw["reasoning_effort"] == "high"
+        assert kw["thinking_mode"] == "enabled"
+        # Explicit chat_template_kwargs override the derived thinking default.
+        assert kw["enable_thinking"] is True
+
+    def test_build_gen_args_reads_chat_template_kwargs(self):
+        request = server_schemas.ChatRequest(
+            messages=[{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"reasoning_effort": "high"},
+        )
+        args = server_app._build_gen_args(request)
+        assert args.chat_template_kwargs == {"reasoning_effort": "high"}
 
     def test_generate_arguments_omits_none_optionals(self):
         args = server.GenerationArguments()

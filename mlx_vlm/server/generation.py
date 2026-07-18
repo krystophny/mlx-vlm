@@ -657,6 +657,12 @@ class GenerationArguments:
     # by another. None = no salt = single-tenant behaviour.
     tenant_id: Optional[str] = None
 
+    # Extra kwargs forwarded verbatim to apply_chat_template(). Lets clients
+    # drive template-level dials that have no dedicated field (MiniMax
+    # thinking_mode, Hunyuan/Hy3 reasoning_effort, ...). Keys here override
+    # the thinking defaults derived from enable_thinking/thinking_*.
+    chat_template_kwargs: Optional[dict] = None
+
     def diffusion_kwargs(self) -> dict:
         """Diffusion-only generation kwargs explicitly supplied by a request."""
         kw = {}
@@ -728,6 +734,8 @@ class GenerationArguments:
             kw["thinking_start_token"] = self.thinking_start_token
         if self.thinking_end_token is not None:
             kw["thinking_end_token"] = self.thinking_end_token
+        if self.chat_template_kwargs:
+            kw.update(self.chat_template_kwargs)
         return kw
 
 
