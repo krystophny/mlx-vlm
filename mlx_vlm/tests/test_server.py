@@ -5535,6 +5535,32 @@ class TestSplitThinking:
         assert reasoning == "Custom reasoning."
         assert content == "Custom answer."
 
+    def test_minimax_m3_tags(self):
+        text = "<mm:think>Compute 19*21 = 399.</mm:think>399"
+        reasoning, content = server._split_thinking(text)
+        assert reasoning == "Compute 19*21 = 399."
+        assert content == "399"
+
+    def test_minimax_m3_prefill_close_only(self):
+        # The M3 template pre-seeds the open tag, so generated text starts
+        # mid-reasoning and carries only the close tag.
+        text = "Compute 19*21 = 399.</mm:think>399"
+        reasoning, content = server._split_thinking(text)
+        assert reasoning == "Compute 19*21 = 399."
+        assert content == "399"
+
+    def test_hy3_tags_close_only(self):
+        text = "We need 17*23 = 391.</think:opensource>391"
+        reasoning, content = server._split_thinking(text)
+        assert reasoning == "We need 17*23 = 391."
+        assert content == "391"
+
+    def test_hy3_full_tags(self):
+        text = "<think:opensource>Reason.</think:opensource>Answer."
+        reasoning, content = server._split_thinking(text)
+        assert reasoning == "Reason."
+        assert content == "Answer."
+
 
 class TestThinkingStreamState:
     """Tests for streaming thinking tag parsing."""
@@ -5567,6 +5593,30 @@ class TestThinkingStreamState:
         assert second.reasoning == " tail"
         assert second.content == "Answer"
         assert second.thinking_closed is True
+
+    def test_minimax_m3_prefill_stream_splits_on_close(self):
+        # M3 prefill mode: stream opens mid-reasoning, only </mm:think> appears.
+        state = server.ThinkingStreamState(enable_thinking=True)
+
+        first = state.feed("Compute 19*21")
+        second = state.feed(" = 399.</mm:th")
+        third = state.feed("ink>399")
+
+        assert first.reasoning == "Compute 19*21"
+        assert first.content is None
+        assert second.thinking_closed is False
+        assert third.thinking_closed is True
+        assert third.content == "399"
+
+    def test_hy3_prefill_stream_splits_on_close(self):
+        state = server.ThinkingStreamState(enable_thinking=True)
+
+        first = state.feed("We need 17*23 = 391.")
+        second = state.feed("</think:opensource>391")
+
+        assert first.reasoning == "We need 17*23 = 391."
+        assert second.thinking_closed is True
+        assert second.content == "391"
 
     def test_custom_markers_split_same_delta_content(self):
         state = server.ThinkingStreamState(

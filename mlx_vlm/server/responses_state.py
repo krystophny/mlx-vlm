@@ -41,6 +41,11 @@ class ThinkingStreamState:
         ("<|channel>thought", "<channel|>"),
         ("<think>", "</think>"),
         ("<|START_THINKING|>", "<|END_THINKING|>"),
+        # MiniMax M3. The template pre-seeds the open tag, so output usually
+        # starts mid-reasoning and only the close tag appears ("prefill" mode).
+        ("<mm:think>", "</mm:think>"),
+        # Tencent Hy3 (hy_v3): '<think{}>'.format(':opensource').
+        ("<think:opensource>", "</think:opensource>"),
     )
 
     def __init__(
