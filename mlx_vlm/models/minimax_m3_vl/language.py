@@ -636,9 +636,67 @@ class MiniMaxM3KVCache:
         self.index_offset = max(0, self.index_offset - trimmed)
         return trimmed
 
+    def clone_for_apc(self, min_capacity_tokens=None):
+        """Clone K/V and sparse-index state for exact-prefix APC reuse.
+
+        MiniMax Sparse Attention needs ``index_keys`` alongside the ordinary
+        attention K/V. APC therefore must preserve this concrete cache type;
+        reducing it to a plain ``KVCache`` would produce incorrect sparse
+        block selection after a warm restore.
+        """
+
+        out = type(self)()
+        offset = int(self.offset)
+        capacity = max(offset, int(min_capacity_tokens or 0))
+
+        if not self.kv_cache.empty():
+            keys = mx.contiguous(
+                mx.array(
+                    self.kv_cache.keys[..., :offset, :], dtype=self.kv_cache.keys.dtype
+                )
+            )
+            values = mx.contiguous(
+                mx.array(
+                    self.kv_cache.values[..., :offset, :],
+                    dtype=self.kv_cache.values.dtype,
+                )
+            )
+            if capacity > offset:
+                keys = mx.pad(keys, [(0, 0), (0, 0), (0, capacity - offset), (0, 0)])
+                values = mx.pad(
+                    values, [(0, 0), (0, 0), (0, capacity - offset), (0, 0)]
+                )
+            out.kv_cache.keys = keys
+            out.kv_cache.values = values
+            out.kv_cache.offset = offset
+
+        if self.index_keys is not None and self.index_offset > 0:
+            index_offset = int(self.index_offset)
+            index_keys = mx.contiguous(
+                mx.array(
+                    self.index_keys[..., :index_offset, :],
+                    dtype=self.index_keys.dtype,
+                )
+            )
+            if capacity > index_offset:
+                index_keys = mx.pad(
+                    index_keys,
+                    [(0, 0), (0, 0), (0, capacity - index_offset), (0, 0)],
+                )
+            out.index_keys = index_keys
+            out.index_offset = index_offset
+
+        return out
+
     @classmethod
     def merge(cls, caches, prefix_lens=None):
         return MiniMaxM3BatchKVCache.merge(caches, prefix_lens=prefix_lens)
+
+    @classmethod
+    def merge_for_apc(cls, caches, prefix_lens=None):
+        """Merge exact-cache rows into the native continuous-batch layout."""
+
+        return cls.merge(caches, prefix_lens=prefix_lens)
 
     @property
     def state(self):

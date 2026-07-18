@@ -30,6 +30,77 @@ from mlx_vlm.models.switch_layers import SwitchGLU
 from mlx_vlm.prompt_utils import apply_chat_template
 
 
+def _fill_minimax_cache(cache, seq_len, *, offset=0):
+    keys = mx.arange(seq_len * 4, dtype=mx.float32).reshape(1, 1, seq_len, 4)
+    values = keys + 1000 + offset
+    index_keys = keys + 2000 + offset
+    cache.update_and_fetch(keys, values)
+    cache.update_index_and_fetch(index_keys)
+    mx.eval(cache.state)
+    return keys, values, index_keys
+
+
+def test_minimax_m3_cache_enables_exact_apc_mode():
+    from mlx_vlm.apc import model_apc_mode
+    from mlx_vlm.models.cache import KVCache
+
+    class MixedCacheModel:
+        def make_cache(self):
+            return [KVCache(), MiniMaxM3KVCache()]
+
+    assert model_apc_mode(MixedCacheModel()) == "exact"
+
+
+def test_minimax_m3_cache_exact_apc_clone_preserves_sparse_index_state():
+    from mlx_vlm.apc import _clone_cache_entry_for_apc
+
+    cache = MiniMaxM3KVCache()
+    keys, values, index_keys = _fill_minimax_cache(cache, 12)
+    eval_targets = []
+    cloned = _clone_cache_entry_for_apc(
+        cache, min_capacity_tokens=20, eval_targets=eval_targets
+    )
+    assert isinstance(cloned, MiniMaxM3KVCache)
+    assert cloned.offset == 12
+    assert cloned.index_offset == 12
+    assert cloned.kv_cache.keys.shape[2] == 20
+    assert cloned.index_keys.shape[2] == 20
+    mx.eval(eval_targets)
+    np.testing.assert_allclose(
+        np.array(cloned.kv_cache.keys[..., :12, :]), np.array(keys)
+    )
+    np.testing.assert_allclose(
+        np.array(cloned.kv_cache.values[..., :12, :]), np.array(values)
+    )
+    np.testing.assert_allclose(
+        np.array(cloned.index_keys[..., :12, :]), np.array(index_keys)
+    )
+
+
+def test_minimax_m3_cache_exact_apc_store_lookup_and_batch_merge():
+    from mlx_vlm.apc import APCManager, make_warm_batch_exact_cache_multi
+
+    first = MiniMaxM3KVCache()
+    second = MiniMaxM3KVCache()
+    _fill_minimax_cache(first, 16, offset=0)
+    _fill_minimax_cache(second, 10, offset=100)
+
+    manager = APCManager(num_blocks=4, block_size=8)
+    tokens = list(range(16))
+    assert manager.store_exact_cache(tokens, [first]) is True
+    warm, matched = manager.lookup_exact_cache(tokens + [99])
+    assert warm is not None
+    assert matched == 16
+    assert isinstance(warm[0], MiniMaxM3KVCache)
+
+    merged, max_prefix = make_warm_batch_exact_cache_multi([warm, [second]], [16, 10])
+    assert max_prefix == 16
+    assert merged is not None
+    assert isinstance(merged[0], MiniMaxM3BatchKVCache)
+    assert merged[0].kv_cache.keys.shape[0] == 2
+    assert merged[0].index_keys.shape[:3] == (2, 1, 16)
+
+
 def _tiny_minimax_text_config(num_hidden_layers=2, **kwargs):
     return TextConfig(
         hidden_size=8,

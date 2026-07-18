@@ -274,6 +274,19 @@ def _clone_cache_entry_for_apc(
         eval_targets.extend([out.keys, out.values])
         return out
 
+    # Model-specific cache protocol. Custom attention implementations can
+    # carry side state in addition to K/V (for example MiniMax M3's sparse
+    # index keys), so flattening them into a plain KVCache is incorrect. Let
+    # the cache preserve its concrete layout while keeping APC independent of
+    # model modules and avoiding an import cycle.
+    clone_for_apc = getattr(c, "clone_for_apc", None)
+    if callable(clone_for_apc):
+        out = clone_for_apc(min_capacity_tokens=min_capacity_tokens)
+        if out is None:
+            return None
+        _collect_mx_arrays(getattr(out, "state", None), eval_targets)
+        return out
+
     return None
 
 
@@ -344,6 +357,10 @@ def _cache_entry_supports_exact_apc(c: Any) -> bool:
         return all(_cache_entry_supports_exact_apc(sub_c) for sub_c in c.caches)
     if isinstance(c, tuple):
         return all(_cache_entry_supports_exact_apc(sub_c) for sub_c in c)
+    if callable(getattr(c, "clone_for_apc", None)) and callable(
+        getattr(type(c), "merge_for_apc", None)
+    ):
+        return True
     return False
 
 
@@ -3015,7 +3032,7 @@ class APCManager:
             free_now = _free_ram_bytes()
             if free_now is not None and free_now < self._disk_min_free_ram_bytes:
                 logger.info(
-                    "APC: skipping exact disk restore " "(free RAM %.1f GB < %.1f GB)",
+                    "APC: skipping exact disk restore (free RAM %.1f GB < %.1f GB)",
                     free_now / (1 << 30),
                     self._disk_min_free_ram_bytes / (1 << 30),
                 )
@@ -3865,6 +3882,9 @@ def _merge_exact_cache_entries(
         if any(c is None for c in merged):
             return None
         return lm_cache.CacheList(*merged)
+    merge_for_apc = getattr(type(first), "merge_for_apc", None)
+    if callable(merge_for_apc) and all(type(c) is type(first) for c in entries):
+        return merge_for_apc(entries, prefix_lens=prefix_lens)
     return None
 
 
