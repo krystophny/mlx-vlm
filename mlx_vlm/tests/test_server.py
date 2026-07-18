@@ -653,8 +653,8 @@ def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
         def insert(self, *args, **kwargs):
             return (1,)
 
-        def next(self, **kwargs):
-            return [], [
+        def decode_step(self):
+            return [
                 SimpleNamespace(
                     uid=1,
                     token=7,
@@ -662,6 +662,9 @@ def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
                     finish_reason="length",
                 )
             ]
+
+        def prefill_step(self):
+            return []
 
     target_config = SimpleNamespace(
         model_type="gemma4_text",
@@ -3963,8 +3966,11 @@ class TestResponseGenerator:
             def __init__(self, response):
                 self.response = response
 
-            def next(self, **kwargs):
-                return [], [self.response]
+            def decode_step(self):
+                return [self.response]
+
+            def prefill_step(self):
+                return []
 
         tokenizer = SentencePieceTokenizer()
         processor = SimpleNamespace(detokenizer=SPMStreamingDetokenizer(tokenizer))
@@ -3981,7 +3987,7 @@ class TestResponseGenerator:
         }
 
         for token in [0, 1, 2]:
-            gen._step(
+            gen._scheduler_iteration(
                 SingleResponseBatch(
                     SimpleNamespace(
                         uid=1,
@@ -3992,7 +3998,7 @@ class TestResponseGenerator:
                 ),
                 active,
             )
-        gen._step(
+        gen._scheduler_iteration(
             SingleResponseBatch(
                 SimpleNamespace(
                     uid=1,
@@ -4085,8 +4091,11 @@ class TestResponseGenerator:
             def __init__(self, response):
                 self.response = response
 
-            def next(self, **kwargs):
-                return [], [self.response]
+            def decode_step(self):
+                return [self.response]
+
+            def prefill_step(self):
+                return []
 
         tokenizer = MixedEmojiTokenizer()
         processor = SimpleNamespace(
@@ -4105,7 +4114,7 @@ class TestResponseGenerator:
         }
 
         for token in [0, 1, 2, 3, 4, 5, 1, 2, 3, 6, 7, 1, 2, 3, 8, 9, 1, 2, 3, 4]:
-            gen._step(
+            gen._scheduler_iteration(
                 SingleResponseBatch(
                     SimpleNamespace(
                         uid=1,
@@ -4116,7 +4125,7 @@ class TestResponseGenerator:
                 ),
                 active,
             )
-        gen._step(
+        gen._scheduler_iteration(
             SingleResponseBatch(
                 SimpleNamespace(
                     uid=1,
@@ -4183,7 +4192,7 @@ class TestResponseGenerator:
                 self._next_uid = 1
                 self._active = {}
                 self.inserted_uids = []
-                self.next_active_sizes = []
+                self.decode_active_sizes = []
                 batch_state["instance"] = self
 
             def insert(self, *args, **kwargs):
@@ -4205,9 +4214,8 @@ class TestResponseGenerator:
             def has_pending_prompts(self):
                 return False
 
-            def next(self, **kwargs):
-                del kwargs
-                self.next_active_sizes.append(len(self._active))
+            def decode_step(self):
+                self.decode_active_sizes.append(len(self._active))
                 responses = []
                 finished = []
                 for uid in sorted(self._active):
@@ -4228,7 +4236,10 @@ class TestResponseGenerator:
                         finished.append(uid)
                 for uid in finished:
                     del self._active[uid]
-                return [], responses
+                return responses
+
+            def prefill_step(self):
+                return []
 
         monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
         monkeypatch.setattr(
@@ -4313,7 +4324,7 @@ class TestResponseGenerator:
 
         batch_gen = batch_state["instance"]
         assert batch_gen.inserted_uids == list(range(1, 9))
-        assert batch_gen.next_active_sizes[:2] == [8, 8]
+        assert batch_gen.decode_active_sizes[:2] == [8, 8]
         assert len(streamed_by_uid) == 8
         for uid, items in streamed_by_uid.items():
             assert items == [
@@ -4344,7 +4355,7 @@ class TestResponseGenerator:
                 batch_state["kwargs"] = kwargs
                 self._next_uid = 1
                 self._active = {}
-                self.next_active_sizes = []
+                self.decode_active_sizes = []
                 batch_state["instance"] = self
 
             def insert(self, *args, **kwargs):
@@ -4365,9 +4376,8 @@ class TestResponseGenerator:
             def has_pending_prompts(self):
                 return False
 
-            def next(self, **kwargs):
-                del kwargs
-                self.next_active_sizes.append(len(self._active))
+            def decode_step(self):
+                self.decode_active_sizes.append(len(self._active))
                 responses = [
                     SimpleNamespace(
                         uid=uid,
@@ -4378,7 +4388,10 @@ class TestResponseGenerator:
                     for uid in sorted(self._active)
                 ]
                 self._active.clear()
-                return [], responses
+                return responses
+
+            def prefill_step(self):
+                return []
 
         monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
         monkeypatch.setattr(
@@ -4466,7 +4479,7 @@ class TestResponseGenerator:
         assert kwargs["draft_block_size"] == 6
         assert kwargs["greedy_sampling"] is True
         assert kwargs["compute_logprobs"] is False
-        assert batch_state["instance"].next_active_sizes == [2]
+        assert batch_state["instance"].decode_active_sizes == [2]
 
     def test_run_coalesces_idle_mtp_batch_generator(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_SPEC_BATCH_COALESCE_MS", "37")
@@ -4546,8 +4559,7 @@ class TestResponseGenerator:
             def has_pending_prompts(self):
                 return False
 
-            def next(self, **kwargs):
-                del kwargs
+            def decode_step(self):
                 responses = [
                     SimpleNamespace(
                         uid=uid,
@@ -4558,7 +4570,10 @@ class TestResponseGenerator:
                     for uid in list(self._active)
                 ]
                 self._active.clear()
-                return [], responses
+                return responses
+
+            def prefill_step(self):
+                return []
 
             def remove(self, uid):
                 return self._active.pop(uid, None) is not None
@@ -4645,7 +4660,9 @@ class TestResponseGenerator:
         assert [bg.sampler for bg in created] == ["sampler-0.0", "sampler-0.6"]
         assert created[0].closed is True
 
-    def test_step_attaches_prompt_metrics_from_prompt_progress(self):
+    def test_scheduler_emits_before_prefill_and_applies_prompt_progress(
+        self, monkeypatch
+    ):
         class SimpleTokenizer:
             vocab = {"hi": 0}
 
@@ -4653,18 +4670,24 @@ class TestResponseGenerator:
                 return "hi" if tokens else ""
 
         class PromptProgressBatch:
-            def next(self, **kwargs):
-                return (
-                    [SimpleNamespace(uid=1, prompt_tps=184.431, cached_tokens=7)],
-                    [
-                        SimpleNamespace(
-                            uid=1,
-                            token=0,
-                            token_logprob=0.0,
-                            finish_reason="stop",
-                        )
-                    ],
+            def __init__(self):
+                self.step = 0
+
+            def decode_step(self):
+                response = SimpleNamespace(
+                    uid=1,
+                    token=self.step,
+                    token_logprob=0.0,
+                    finish_reason="stop" if self.step else None,
                 )
+                self.step += 1
+                return [response]
+
+            def prefill_step(self):
+                assert not rqueue.empty(), "decode response must be emitted first"
+                if self.step == 1:
+                    return [SimpleNamespace(uid=1, prompt_tps=184.431, cached_tokens=7)]
+                return []
 
         tokenizer = SimpleTokenizer()
         processor = SimpleNamespace(
@@ -4683,13 +4706,70 @@ class TestResponseGenerator:
                 "cached_tokens": 0,
             }
         }
+        yield_calls = []
 
-        gen._step(PromptProgressBatch(), active)
+        def yield_to_consumer(seconds):
+            assert seconds == 0
+            assert not rqueue.empty(), "decode response must be emitted before yielding"
+            yield_calls.append(seconds)
+
+        monkeypatch.setattr(server_generation.time, "sleep", yield_to_consumer)
+
+        batch = PromptProgressBatch()
+        gen._scheduler_iteration(batch, active)
+
+        first = rqueue.get()
+        assert first.prompt_tps is None
+        assert first.cached_tokens == 0
+
+        gen._scheduler_iteration(batch, active)
 
         item = rqueue.get()
         assert item.prompt_tps == pytest.approx(184.431)
         assert item.cached_tokens == 7
         assert rqueue.get() is None
+        assert yield_calls == [0, 0]
+
+    def test_scheduler_runs_one_decode_before_one_prefill(self):
+        class PhasedBatch:
+            def __init__(self):
+                self.calls = []
+
+            def decode_step(self):
+                self.calls.append("decode")
+                return [
+                    SimpleNamespace(
+                        uid=1,
+                        token=0,
+                        token_logprob=0.0,
+                        finish_reason=None,
+                    )
+                ]
+
+            def prefill_step(self):
+                self.calls.append("prefill")
+                return []
+
+        class Streamer:
+            def advance(self, token, finish_reason):
+                return str(token)
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        rqueue = Queue()
+        active = {
+            1: {
+                "rqueue": rqueue,
+                "streamer": Streamer(),
+                "prompt_tps": None,
+                "cached_tokens": 0,
+            }
+        }
+        batch = PhasedBatch()
+
+        gen._scheduler_iteration(batch, active)
+
+        assert batch.calls == ["decode", "prefill"]
+        assert rqueue.get().token == 0
 
     def test_generate_arguments_to_generate_kwargs(self):
         processor = lambda tokens, logits: logits
