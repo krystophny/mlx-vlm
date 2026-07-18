@@ -4759,6 +4759,7 @@ class TestResponseGenerator:
 
     def test_build_gen_args_reads_chat_template_kwargs(self):
         request = server_schemas.ChatRequest(
+            model="test-model",
             messages=[{"role": "user", "content": "hi"}],
             chat_template_kwargs={"reasoning_effort": "high"},
         )
